@@ -24,7 +24,7 @@ to install the required packages
 **Start**
 To start run
 ```
-node .
+pnpm start
 ```
 
 ## Usage

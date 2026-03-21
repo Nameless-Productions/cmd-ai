@@ -5,7 +5,8 @@
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc && chmod +x ./dist/index.js"
+    "build": "tsc && chmod +x ./dist/index.js",
+    "start": "node ."
   },
   "keywords": [],
   "author": "",
