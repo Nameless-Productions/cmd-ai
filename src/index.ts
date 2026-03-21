@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
 import Anthropic from "@anthropic-ai/sdk";
+import { count } from "console";
 import "dotenv/config";
-import { readdirSync, readFileSync, writeFileSync } from "fs";
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "fs";
 import { createInterface } from "readline/promises";
 
 const client = new Anthropic({
@@ -17,6 +18,11 @@ let mcpProcess: any = null;
 let history: Array<{role: "user" | "assistant", content: string}> = []
 let finalInp: number = 0;
 let finalOut: number = 0;
+let cont: boolean = false;
+let toolRetryCount: number = 0;
+const MAX_RETRIES = 3;
+
+let contTool: boolean = false;
 
 
 function getAvailableTools() {
@@ -68,7 +74,7 @@ function getAvailableTools() {
 
         {
             name: "edit_file",
-            description: "Edit a file. If the file doesn't exists then it will create it",
+            description: "Edit a file. ALWAYS provide the complete file content. If the file doesn't exist, it will be created. If the folder doesn't exist, create it first.",
             input_schema: {
                 type: "object",
                 properties: {
@@ -78,10 +84,25 @@ function getAvailableTools() {
                     },
                     content: {
                         type: "string",
-                        description: "The new content of the file"
+                        description: "The complete new content of the file - this is REQUIRED"
                     }
                 },
                 required: ["path", "content"]
+            }
+        },
+
+        {
+            name: "create_folder",
+            description: "Create a folder",
+            input_schema: {
+                type: "object",
+                properties: {
+                    path: {
+                        type: "string",
+                        description: "The full path of the new folder"
+                    }
+                },
+                required: ["path"]
             }
         },
     ];
@@ -92,8 +113,26 @@ async function Main(){
 
     while (true){
         const rl = createInterface({input: process.stdin, output: process.stdout});
-        let question = await rl.question("Input: ");
-        rl.close();
+        let question;
+        if(cont){
+            if(toolRetryCount >= MAX_RETRIES) {
+                console.log("Max retries reached. Moving on.");
+                cont = false;
+                toolRetryCount = 0;
+            } else {
+                question = "You ran a tool and you had to stop because of that but the tool ran succesfuly so you don't have to do it again. Now please continue where you left. This is a automated message so do not mention it.";
+                cont = false;
+                toolRetryCount++;
+            }
+        }
+        
+        if(!cont){
+            question = await rl.question("you: ");
+            rl.close();
+            toolRetryCount = 0;
+        }
+
+        if(question == "" || !question || question == null) question = "Message provided by user was empty"
 
         if(question == "/exit"){
             console.log("\nFinal Tokens:\nInp:", finalInp, "\nOut:", finalOut);
@@ -101,7 +140,6 @@ async function Main(){
             break;
         }
 
-        if(!question || question === "" || question === null) question = "You probally just ran a tool and please continue the conversation exactly where you left. if the tool has a response then you should be able to see it in the message history. Do not say anything about this message because it's a automatic message.";
 
         history.push({
             role: "user",
@@ -116,9 +154,15 @@ async function Main(){
             system: [
                 {
                     type: "text",
-                    text: `You are a coding assistant in development. Here are some information: Currect working dir: ${process.cwd()}`,
-                }
-            ]
+                    text: `You are a coding assistant in development. Current working dir: ${process.cwd()}. 
+IMPORTANT RULES:
+1. When you need to perform multiple related operations (like creating a folder then editing a file in it), use multiple tools in a single response.
+2. For edit_file, ALWAYS provide the complete file content - this is mandatory. Never call edit_file without the content parameter.
+3. When tools return information, continue with your next action in the same response.
+4. Check if folders exist before creating them using create_folder.`,
+    }
+]
+
         })
 
         let fullText = "";
@@ -131,6 +175,8 @@ async function Main(){
             console.log("\nTokens:\nInp:", msg.usage.input_tokens, "\nOut:", msg.usage.output_tokens);
             finalInp = finalInp + msg.usage.input_tokens;
             finalOut = finalOut + msg.usage.output_tokens;
+
+            let hasValidToolUse = false;
 
             if(msg.content){
                 for(const block of msg.content){
@@ -145,30 +191,87 @@ async function Main(){
                         else if(block.name == "list_things"){
                             const input = block.input as { path?: string };
                             if(input?.path){
-                                history.push({
-                                    role: "user",
-                                    content: `Contents of: ${input.path} are: ${readdirSync(input.path).join(", ")}`
-                                })
-                                console.log("Press enter to continue the conversation");
+                                try {
+                                    const contents = readdirSync(input.path).join(", ");
+                                    history.push({
+                                        role: "user",
+                                        content: `Contents of: ${input.path} are: ${contents}`
+                                    })
+                                    cont = true;
+                                } catch (err: any) {
+                                    history.push({
+                                        role: "user",
+                                        content: `Error reading folder: ${err.message}`
+                                    })
+                                    cont = true;
+                                }
                             }
                         }
 
                         else if(block.name == "view_file"){
                             const input = block.input as { path?: string };
                             if(input?.path){
-                                const file = readFileSync(input.path, "utf-8");
-                                history.push({
-                                    role: "user",
-                                    content: `Contents of: ${input.path} are: ${file}`
-                                })
-                                console.log("Press enter to continue the conversation");
+                                try {
+                                    const file = readFileSync(input.path, "utf-8");
+                                    history.push({
+                                        role: "user",
+                                        content: `Contents of: ${input.path} are: ${file}`
+                                    })
+                                    cont = true
+                                } catch (err: any) {
+                                    history.push({
+                                        role: "user",
+                                        content: `Error reading file: ${err.message}`
+                                    })
+                                    cont = true;
+                                }
                             }
                         }
 
                         else if(block.name == "edit_file"){
                             const input = block.input as { path?: string, content?: string };
-                            if(input?.path && input?.content){
-                                writeFileSync(input.path, input.content, "utf-8");
+                            if(!input?.path || !input?.content){
+                                history.push({
+                                    role: "user",
+                                    content: `Error: edit_file requires both 'path' and 'content'. You provided - path: ${input?.path ? 'yes' : 'no'}, content: ${input?.content ? 'yes' : 'no'}. Include the complete file content.`
+                                })
+                                cont = true;
+                            } else {
+                                try {
+                                    writeFileSync(input.path, input.content, "utf-8");
+                                    history.push({
+                                        role: "user",
+                                        content: `File created/updated successfully: ${input.path}`
+                                    })
+                                    hasValidToolUse = true;
+                                    cont = true;
+                                } catch (err: any) {
+                                    history.push({
+                                        role: "user",
+                                        content: `Error writing file: ${err.message}`
+                                    })
+                                    cont = true;
+                                }
+                            }
+                        }
+
+                        else if(block.name == "create_folder"){
+                            const input = block.input as { path?: string }
+                            if(input.path){
+                                try {
+                                    mkdirSync(input.path, { recursive: true });
+                                    history.push({
+                                        role: "user",
+                                        content: `Folder created successfully: ${input.path}`
+                                    })
+                                    cont = true;
+                                } catch (err: any) {
+                                    history.push({
+                                        role: "user",
+                                        content: `Error creating folder: ${err.message}`
+                                    })
+                                    cont = true;
+                                }
                             }
                         }
                     }
@@ -181,7 +284,7 @@ async function Main(){
         });
         
         await stream.finalMessage();
-        
+
         history.push({
             role: "assistant",
             content: fullText
